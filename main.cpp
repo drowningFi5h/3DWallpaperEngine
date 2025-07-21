@@ -8,6 +8,32 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "libs/stb_image.h"
+
+#include <DirectXMath.h>
+#include <filesystem>
+using namespace DirectX;
+
+// GLobals
+ID3D11Device* g_device = nullptr;
+ID3D11DeviceContext* g_context = nullptr;
+IDXGISwapChain* g_swapchain = nullptr;
+ID3D11RenderTargetView* g_renderTargetView = nullptr;
+ID3D11ShaderResourceView* g_srv = nullptr;
+ID3D11Buffer* g_vertexBuffer = nullptr;
+ID3D11VertexShader* g_vertexShader = nullptr;
+ID3D11PixelShader* g_pixelShader = nullptr;
+ID3D11InputLayout* g_inputLayout = nullptr;
+ID3D11Buffer* g_constantBuffer = nullptr;
+ID3D11ShaderResourceView* g_textureView = nullptr;
+float position = 0.5f; // Default head position
+
+struct Vertex {
+    float x, y; // Position
+    float u, v; // Texture coordinates (UV)
+};
+
 
 float ReadHeadPosition() {
     // Open the shared memory
@@ -44,6 +70,7 @@ float ReadHeadPosition() {
 }
 
 std::deque<float> headPositions;
+
 float GetSmoothedHeadPosition() {
     if (headPositions.size() >= 5) {
         headPositions.pop_front();
@@ -59,54 +86,208 @@ float GetSmoothedHeadPosition() {
 }
 
 
+bool LoadTexture(const char* filename) {
 
-ID3D11Device* g_device = nullptr;
-ID3D11DeviceContext* g_context = nullptr;
-IDXGISwapChain* g_swapchain = nullptr;
-ID3D11RenderTargetView* g_renderTargetView = nullptr;
-ID3D11ShaderResourceView* g_srv = nullptr;
+    if (!std::filesystem::exists(filename)) {
+        std::cerr << "ERROR texture file not found"<< filename << std::endl;
+        return false;
+    }
+    int width, height, channels;
+    unsigned char* pixels = stbi_load(filename, &width, &height, &channels, 4);
+    if (!pixels) {
+        std::cerr << "ERROR: stbi_load failed for: " << filename
+                  << " (Reason: " << stbi_failure_reason() << ")" << std::endl;
+        return false;
+    }
 
-bool InitializeD3D(HWND hwnd) {
-    DXGI_SWAP_CHAIN_DESC scd = {0};
-    scd.BufferCount=1;
-    scd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
-    scd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    scd.OutputWindow=hwnd;
-    scd.SampleDesc.Count=1;
-    scd.Windowed=TRUE;
+    D3D11_TEXTURE2D_DESC desc = {0};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
+    D3D11_SUBRESOURCE_DATA initData = {0};
+    initData.pSysMem = pixels;
+    initData.SysMemPitch = width * 4;
 
-    D3D11CreateDeviceAndSwapChain(
-        nullptr,
-        D3D_DRIVER_TYPE_HARDWARE,
-        nullptr,
-        0,
-        nullptr,
-        0,
-        D3D11_SDK_VERSION,
-        &scd,
-        &g_swapchain,
-        &g_device,
-        nullptr,
-        &g_context
-        );
+    ID3D11Texture2D* texture;
+    HRESULT hr = g_device->CreateTexture2D(&desc, &initData, &texture);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create texture (Error: " << hr << ")" << std::endl;
+        stbi_image_free(pixels);
+        return false;
+    }
 
-    ID3D11Texture2D* pbackBuffer;
-    g_swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pbackBuffer);
-    g_device->CreateRenderTargetView(pbackBuffer, nullptr, &g_renderTargetView);
-    pbackBuffer->Release();
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = desc.Format;
+    srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+    srvDesc.Texture2D.MipLevels = 1;
 
+    hr = g_device->CreateShaderResourceView(texture, &srvDesc, &g_textureView);
+    texture->Release();
+
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create shader resource view (Error: " << hr << ")" << std::endl;
+        stbi_image_free(pixels);
+        return false;
+    }
+
+    stbi_image_free(pixels);
     return true;
-
 }
 
-void RenderFrame() {
-    float headPosition = GetSmoothedHeadPosition();
-    std::cout << "Smoothed Head Position: " << headPosition << std::endl;
+bool CreateFullscreenQuad() {
+    Vertex vertices[] = {
+        {-1.0f,  1.0f, 0.0f, 0.0f}, // Top-left
+        { 1.0f,  1.0f, 1.0f, 0.0f}, // Top-right
+        {-1.0f, -1.0f, 0.0f, 1.0f}, // Bottom-left
+        { 1.0f, -1.0f, 1.0f, 1.0f}  // Bottom-right
+    };
+    D3D11_BUFFER_DESC vertexBufferDesc = {0};
+    vertexBufferDesc.ByteWidth = sizeof(vertices);
+    vertexBufferDesc.Usage = D3D11_USAGE_DEFAULT;
+    vertexBufferDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
 
-    float color[4] = {headPosition, 0.2f, 0.4f, 1.0f};
+    D3D11_SUBRESOURCE_DATA initData = {0};
+    initData.pSysMem = vertices;
 
+    HRESULT hr = g_device->CreateBuffer(&vertexBufferDesc, &initData, &g_vertexBuffer);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create vertex buffer (Error: " << hr << ")" << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool CompileShaders() {
+    ID3DBlob* vsBlob = nullptr;
+    ID3DBlob* errorBlob = nullptr;
+
+    if (!std::filesystem::exists(L"shader.hlsl")) {
+        std::cerr << "shader.hlsl not found!" << std::endl;
+        return false;
+    }
+
+    HRESULT hr = D3DCompileFromFile(L"shader.hlsl", nullptr, nullptr, "VSmain", "vs_5_0", 0, 0, &vsBlob, &errorBlob);
+    if (FAILED(hr)) {
+        if (errorBlob) {
+            std::cerr << "Vertex Shader Error: " << (char*)errorBlob->GetBufferPointer() << std::endl;
+            errorBlob->Release();
+        }
+        return false;
+    }
+
+    hr = g_device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &g_vertexShader);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create vertex shader" << std::endl;
+        vsBlob->Release();
+        return false;
+    }
+
+    // Create input layout
+    D3D11_INPUT_ELEMENT_DESC layout[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0}
+    };
+
+    hr = g_device->CreateInputLayout(layout, 2, vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), &g_inputLayout);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create input layout" << std::endl;
+        vsBlob->Release();
+        return false;
+    }
+    vsBlob->Release();
+
+    // Compile pixel shader
+    ID3DBlob* psBlob = nullptr;
+    hr = D3DCompileFromFile(L"shader.hlsl", nullptr, nullptr, "PSmain", "ps_5_0", 0, 0, &psBlob, &errorBlob);
+    if (FAILED(hr)) {
+        if (errorBlob) {
+            std::cerr << "Pixel Shader Error: " << (char*)errorBlob->GetBufferPointer() << std::endl;
+            errorBlob->Release();
+        }
+        return false;
+    }
+
+    hr = g_device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &g_pixelShader);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create pixel shader" << std::endl;
+        psBlob->Release();
+        return false;
+    }
+    psBlob->Release();
+
+    // Create sampler state (missing in original code)
+    D3D11_SAMPLER_DESC sampDesc = {};
+    sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+    sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+    sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    sampDesc.MinLOD = 0;
+    sampDesc.MaxLOD = D3D11_FLOAT32_MAX;
+
+    ID3D11SamplerState* samplerState = nullptr;
+    hr = g_device->CreateSamplerState(&sampDesc, &samplerState);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create sampler state" << std::endl;
+        return false;
+    }
+
+    // Set the sampler state
+    g_context->PSSetSamplers(0, 1, &samplerState);
+
+    // Create constant buffer
+    D3D11_BUFFER_DESC cbDesc = {0};
+    cbDesc.ByteWidth = 16;
+    cbDesc.Usage = D3D11_USAGE_DYNAMIC;
+    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = g_device->CreateBuffer(&cbDesc, nullptr, &g_constantBuffer);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create constant buffer" << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+void RenderFrame(float position) {
+
+    g_context->OMSetRenderTargets(1, &g_renderTargetView, nullptr);
+
+    float color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     g_context->ClearRenderTargetView(g_renderTargetView, color);
+
+    //HEad Tracking OFFSET
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    g_context->Map(g_constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+
+
+    XMFLOAT2 offset = {(position - 0.5f) * 0.4f, 0.0f}; // OFFSET for head tracking
+
+    memcpy(mapped.pData, &offset, sizeof(XMFLOAT2));
+
+    g_context->Unmap(g_constantBuffer, 0); // UNMAP
+
+    //SETTING SHADER AND BUFFER PIPELINE
+    g_context->VSSetShader(g_vertexShader, nullptr, 0);
+    g_context->PSSetShader(g_pixelShader, nullptr, 0);
+    g_context->IASetInputLayout(g_inputLayout);
+    g_context->VSSetConstantBuffers(0, 1, &g_constantBuffer);
+    g_context->PSSetShaderResources(0, 1, &g_textureView);
+
+    // FULL SCREEN QUAD
+    UINT stride = sizeof(Vertex);
+    UINT vbOffset = 0;
+    g_context->IASetVertexBuffers(0, 1, &g_vertexBuffer, &stride, &vbOffset);
+    g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    g_context->Draw(4, 0);
     g_swapchain->Present(1, 0);
 }
 
@@ -118,7 +299,69 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     return DefWindowProc(hwnd, msg, w, l);
 }
 
+bool InitializeD3D(HWND hwnd) {
+    DXGI_SWAP_CHAIN_DESC scd = {0};
+    scd.BufferCount=1;
+    scd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    scd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    scd.OutputWindow=hwnd;
+    scd.SampleDesc.Count=1;
+    scd.Windowed=TRUE;
+    UINT createDeviceFlags = D3D11_CREATE_DEVICE_DEBUG;
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(
+        nullptr,
+        D3D_DRIVER_TYPE_HARDWARE,
+        nullptr,
+        createDeviceFlags,
+        nullptr,
+        0,
+        D3D11_SDK_VERSION,
+        &scd,
+        &g_swapchain,
+        &g_device,
+        nullptr,
+        &g_context
+        );
+
+    if (FAILED(hr)) {
+        MessageBoxW(hwnd, L"DirectX3D init failed", L"Error", MB_OK);
+        return false;
+    }
+
+    ID3D11Texture2D* pbackBuffer;
+    g_swapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pbackBuffer);
+    g_device->CreateRenderTargetView(pbackBuffer, nullptr, &g_renderTargetView);
+    pbackBuffer->Release();
+
+    if (!CreateFullscreenQuad()) {
+        std::cerr << "Failed to create fullscreen quad" << std::endl;
+        MessageBoxW(hwnd, L"Failed to create fullscreen quad", L"Error", MB_OK);
+        return false;
+    }
+
+    if (!CompileShaders()) {
+        std::cerr << "Failed to compile shaders" << std::endl;
+        MessageBoxW(hwnd, L"Failed to compile shaders", L"Error", MB_OK);
+        return false;
+    }
+
+    if (!LoadTexture("C:\\PROJECTS\\ENGINE\\Wallpapers\\wallhaven.png")) {
+        std::cerr << "Failed to load texture" << std::endl;
+        MessageBoxW(hwnd, L"Failed to load texture", L"Error", MB_OK);
+        return false;
+    }
+
+    D3D11_VIEWPORT viewport = {0.0f, 0.0f, 800.0f, 600.0f, 0.0f, 1.0f};
+    g_context->RSSetViewports(1, &viewport);
+    return true;
+
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
+    char currentDir[MAX_PATH];
+    GetCurrentDirectoryA(MAX_PATH, currentDir);
+    std::cerr << "Current Directory: " << currentDir << std::endl;
+
     WNDCLASS wc = {0};
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
@@ -147,11 +390,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         } else {
-            RenderFrame();
-            float headPosition = ReadHeadPosition();
-            std::cout << "Head Position: " << headPosition << std::endl;
+
+            position = ReadHeadPosition();
+            RenderFrame(position);
         }
     }
+    if (g_vertexBuffer) g_vertexBuffer->Release();
+    if (g_vertexShader) g_vertexShader->Release();
+    if (g_pixelShader) g_pixelShader->Release();
+    if (g_inputLayout) g_inputLayout->Release();
+    if (g_constantBuffer) g_constantBuffer->Release();
+    if (g_textureView) g_textureView->Release();
 
     g_renderTargetView->Release();
     g_swapchain->Release();
