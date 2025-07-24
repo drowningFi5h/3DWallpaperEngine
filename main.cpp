@@ -15,18 +15,27 @@
 #include <filesystem>
 using namespace DirectX;
 
+//------------------------------------------------------------------------------------------------------------------------------------------------
+
+// LAYERS
+#define MAX_LAYERS 4
+
 // GLobals
 ID3D11Device* g_device = nullptr;
 ID3D11DeviceContext* g_context = nullptr;
 IDXGISwapChain* g_swapchain = nullptr;
 ID3D11RenderTargetView* g_renderTargetView = nullptr;
-ID3D11ShaderResourceView* g_srv = nullptr;
+ID3D11ShaderResourceView* g_textureViews[MAX_LAYERS] = { nullptr };
 ID3D11Buffer* g_vertexBuffer = nullptr;
 ID3D11VertexShader* g_vertexShader = nullptr;
 ID3D11PixelShader* g_pixelShader = nullptr;
 ID3D11InputLayout* g_inputLayout = nullptr;
 ID3D11Buffer* g_constantBuffer = nullptr;
-ID3D11ShaderResourceView* g_textureView = nullptr;
+ID3D11SamplerState* g_samplerState = nullptr;
+
+bool g_use3DParallax = false;
+
+
 float position = 0.5f; // Default head position
 
 struct Vertex {
@@ -35,8 +44,17 @@ struct Vertex {
 };
 
 
+struct ConstantBuffer {
+    XMFLOAT2 offset;         // Head position offset
+    float parallaxIntensity;
+    float use3DParallax;     //toggle between 2D/3D
+};
+
+//------------------------------------------------------------------------------------------------------------------------------------------------
+// HEAD POSITION AND SMOOTHING THE ANGLES
+
 float ReadHeadPosition() {
-    // Open the shared memory
+    //SHARED MEMORY
     HANDLE hMap = OpenFileMapping(
         FILE_MAP_READ,
         FALSE,
@@ -47,7 +65,6 @@ float ReadHeadPosition() {
         return 0.5f;
     }
 
-    // Map to the floating pointer
     float* headX = (float*)MapViewOfFile(
         hMap,
         FILE_MAP_READ,
@@ -86,12 +103,19 @@ float GetSmoothedHeadPosition() {
 }
 
 
-bool LoadTexture(const char* filename) {
+//---------------------------------------------------------------------------------------------------------------------------
 
-    if (!std::filesystem::exists(filename)) {
-        std::cerr << "ERROR texture file not found"<< filename << std::endl;
+bool LoadTexture(const char* filename, int layerIndex) {
+    if (layerIndex < 0 || layerIndex >= MAX_LAYERS) {
+        std::cerr << "ERROR: Invalid layer index: " << layerIndex << std::endl;
         return false;
     }
+
+    if (!std::filesystem::exists(filename)) {
+        std::cerr << "ERROR texture file not found: " << filename << std::endl;
+        return false;
+    }
+
     int width, height, channels;
     unsigned char* pixels = stbi_load(filename, &width, &height, &channels, 4);
     if (!pixels) {
@@ -128,7 +152,7 @@ bool LoadTexture(const char* filename) {
     srvDesc.Texture2D.MostDetailedMip = 0;
     srvDesc.Texture2D.MipLevels = 1;
 
-    hr = g_device->CreateShaderResourceView(texture, &srvDesc, &g_textureView);
+    hr = g_device->CreateShaderResourceView(texture, &srvDesc, &g_textureViews[layerIndex]);
     texture->Release();
 
     if (FAILED(hr)) {
@@ -138,8 +162,27 @@ bool LoadTexture(const char* filename) {
     }
 
     stbi_image_free(pixels);
+    std::cout << "Successfully loaded texture: " << filename << " into layer " << layerIndex << std::endl;
     return true;
 }
+
+
+//------------------------------------------------------------------------------------------------------------------------------------------------
+// PARALLAX LAYERS LOADING
+
+bool LoadAllLayers(const char* baseLayerPath, const char* midLayerPath, const char* topLayerPath, const char* depthMapPath) {
+    bool success = true;
+
+    success &= LoadTexture(topLayerPath, 0);
+    success &= LoadTexture(midLayerPath, 1);
+    success &= LoadTexture(baseLayerPath, 2);
+    success &= LoadTexture(depthMapPath, 3);
+    return success;
+}
+
+
+//------------------------------------------------------------------------------------------------------------------------------------------------
+// FULLSCREEN QUAD CREATION
 
 bool CreateFullscreenQuad() {
     Vertex vertices[] = {
@@ -163,6 +206,10 @@ bool CreateFullscreenQuad() {
     }
     return true;
 }
+
+
+//------------------------------------------------------------------------------------------------------------------------------------------------
+// SHADER COMPILATION AND SETUP
 
 bool CompileShaders() {
     ID3DBlob* vsBlob = nullptr;
@@ -189,7 +236,7 @@ bool CompileShaders() {
         return false;
     }
 
-    // Create input layout
+    // INPUT LAYOUT
     D3D11_INPUT_ELEMENT_DESC layout[] = {
         {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0}
@@ -203,7 +250,7 @@ bool CompileShaders() {
     }
     vsBlob->Release();
 
-    // Compile pixel shader
+    // PIXEL SHADER CREATION AND COMPILATION
     ID3DBlob* psBlob = nullptr;
     hr = D3DCompileFromFile(L"shader.hlsl", nullptr, nullptr, "PSmain", "ps_5_0", 0, 0, &psBlob, &errorBlob);
     if (FAILED(hr)) {
@@ -222,29 +269,27 @@ bool CompileShaders() {
     }
     psBlob->Release();
 
-    // Create sampler state (missing in original code)
+    // SAMPLE STATE
     D3D11_SAMPLER_DESC sampDesc = {};
     sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-    sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
-    sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
-    sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
     sampDesc.MinLOD = 0;
     sampDesc.MaxLOD = D3D11_FLOAT32_MAX;
 
-    ID3D11SamplerState* samplerState = nullptr;
-    hr = g_device->CreateSamplerState(&sampDesc, &samplerState);
+    hr = g_device->CreateSamplerState(&sampDesc, &g_samplerState);
     if (FAILED(hr)) {
         std::cerr << "Failed to create sampler state" << std::endl;
         return false;
     }
 
-    // Set the sampler state
-    g_context->PSSetSamplers(0, 1, &samplerState);
+    g_context->PSSetSamplers(0, 1, &g_samplerState);
 
-    // Create constant buffer
+    // CONSTANT BUFFER
     D3D11_BUFFER_DESC cbDesc = {0};
-    cbDesc.ByteWidth = 16;
+    cbDesc.ByteWidth = sizeof(ConstantBuffer); // 4
     cbDesc.Usage = D3D11_USAGE_DYNAMIC;
     cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -257,38 +302,48 @@ bool CompileShaders() {
     return true;
 }
 
-void RenderFrame(float position) {
+//------------------------------------------------------------------------------------------------------------------------------------------------
+// RENDERING FRAME
 
+void RenderFrame(float position) {
     g_context->OMSetRenderTargets(1, &g_renderTargetView, nullptr);
 
     float color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     g_context->ClearRenderTargetView(g_renderTargetView, color);
 
-    //HEad Tracking OFFSET
+    // Map constant buffer and update with head position data
     D3D11_MAPPED_SUBRESOURCE mapped;
     g_context->Map(g_constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
 
+    ConstantBuffer cb;
+    cb.offset = XMFLOAT2((position - 0.5f) * 0.4f, 0.0f); // Horizontal head tracking offset
+    cb.parallaxIntensity = 1.0f; // PARALLAX STRENGTH
+    cb.use3DParallax = g_use3DParallax ? 1.0f : 0.0f;
 
-    XMFLOAT2 offset = {(position - 0.5f) * 0.4f, 0.0f}; // OFFSET for head tracking
+    memcpy(mapped.pData, &cb, sizeof(ConstantBuffer));
+    g_context->Unmap(g_constantBuffer, 0);
 
-    memcpy(mapped.pData, &offset, sizeof(XMFLOAT2));
-
-    g_context->Unmap(g_constantBuffer, 0); // UNMAP
-
-    //SETTING SHADER AND BUFFER PIPELINE
+    // RENDERING PIPELINE
     g_context->VSSetShader(g_vertexShader, nullptr, 0);
     g_context->PSSetShader(g_pixelShader, nullptr, 0);
     g_context->IASetInputLayout(g_inputLayout);
     g_context->VSSetConstantBuffers(0, 1, &g_constantBuffer);
-    g_context->PSSetShaderResources(0, 1, &g_textureView);
+    g_context->PSSetConstantBuffers(0, 1, &g_constantBuffer);
 
-    // FULL SCREEN QUAD
+    // INIT TEXTURE LAYERS
+    g_context->PSSetShaderResources(0, MAX_LAYERS, g_textureViews);
+
+    // INIT SAMPLE STATE
+    g_context->PSSetSamplers(0, 1, &g_samplerState);
+
+    // INIT FULLSCREEN QUAD
     UINT stride = sizeof(Vertex);
     UINT vbOffset = 0;
     g_context->IASetVertexBuffers(0, 1, &g_vertexBuffer, &stride, &vbOffset);
     g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     g_context->Draw(4, 0);
-    g_swapchain->Present(1, 0);
+
+    g_swapchain->Present(1, 0); // VSYNC
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
@@ -298,6 +353,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM w, LPARAM l) {
     }
     return DefWindowProc(hwnd, msg, w, l);
 }
+
+
+//------------------------------------------------------------------------------------------------------------------------------------------------
+// INITIALIZE DIRECT3D
 
 bool InitializeD3D(HWND hwnd) {
     DXGI_SWAP_CHAIN_DESC scd = {0};
@@ -345,17 +404,24 @@ bool InitializeD3D(HWND hwnd) {
         return false;
     }
 
-    if (!LoadTexture("C:\\PROJECTS\\ENGINE\\Wallpapers\\wallhaven.png")) {
-        std::cerr << "Failed to load texture" << std::endl;
-        MessageBoxW(hwnd, L"Failed to load texture", L"Error", MB_OK);
+    if (!LoadAllLayers(
+        "C:\\PROJECTS\\ENGINE\\Wallpapers\\back.png",
+        "C:\\PROJECTS\\ENGINE\\Wallpapers\\middle.png",
+        "C:\\PROJECTS\\ENGINE\\Wallpapers\\front.png",
+        "C:\\PROJECTS\\ENGINE\\Wallpapers\\depth_map.png"
+    )) {
+        std::cerr << "Failed to load texture layers" << std::endl;
+        MessageBoxW(hwnd, L"Failed to load texture layers", L"Error", MB_OK);
         return false;
     }
 
     D3D11_VIEWPORT viewport = {0.0f, 0.0f, 800.0f, 600.0f, 0.0f, 1.0f};
     g_context->RSSetViewports(1, &viewport);
     return true;
-
 }
+
+
+//------------------------------------------------------------------------------------------------------------------------------------------------
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     char currentDir[MAX_PATH];
@@ -384,28 +450,48 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         return -1;
     }
 
+    std::cout << "Parallax Wallpaper Controls:" << std::endl;
+    std::cout << "  Space - Toggle between 2D/3D parallax modes" << std::endl;
+    std::cout << "  ESC - Exit" << std::endl;
+
     MSG msg = {0};
     while (msg.message != WM_QUIT) {
         if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_KEYDOWN) {
+                if (msg.wParam == VK_SPACE) {
+                    // Toggle between 2D and 3D parallax modes
+                    g_use3DParallax = !g_use3DParallax;
+                    std::cout << "Switched to " << (g_use3DParallax ? "3D" : "2D") << " parallax mode" << std::endl;
+                }
+                else if (msg.wParam == VK_ESCAPE) {
+                    PostQuitMessage(0);
+                }
+            }
+
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         } else {
-
-            position = ReadHeadPosition();
+            position = GetSmoothedHeadPosition();
             RenderFrame(position);
         }
     }
+
+    // Cleanup
+    for (int i = 0; i < MAX_LAYERS; i++) {
+        if (g_textureViews[i]) g_textureViews[i]->Release();
+    }
+
     if (g_vertexBuffer) g_vertexBuffer->Release();
     if (g_vertexShader) g_vertexShader->Release();
     if (g_pixelShader) g_pixelShader->Release();
     if (g_inputLayout) g_inputLayout->Release();
     if (g_constantBuffer) g_constantBuffer->Release();
-    if (g_textureView) g_textureView->Release();
+    if (g_samplerState) g_samplerState->Release();
 
-    g_renderTargetView->Release();
-    g_swapchain->Release();
-    g_context->Release();
-    g_device->Release();
+    if (g_renderTargetView) g_renderTargetView->Release();
+    if (g_swapchain) g_swapchain->Release();
+    if (g_context) g_context->Release();
+    if (g_device) g_device->Release();
 
     return 0;
 }
